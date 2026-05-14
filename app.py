@@ -205,11 +205,11 @@ def plot_missing_heatmap(df):
 # ----------------------------------------------------------------------
 def main():
     st.set_page_config(page_title="Анализ качества данных", layout="wide")
-    st.title("📊 Интеллектуальная система анализа качества данных")
+    st.title("Интеллектуальная система анализа качества данных")
 
     # --- Боковая панель ---
     with st.sidebar:
-        st.header("🔌 Подключение к БД")
+        st.header("Подключение к БД")
         db_type = st.selectbox("Тип СУБД", ["SQLite", "PostgreSQL", "MySQL"])
         if db_type == "SQLite":
             host = ""
@@ -241,7 +241,7 @@ def main():
 
     # --- Выбор таблицы ---
     if 'engine' in st.session_state and 'tables' in st.session_state:
-        selected_table = st.selectbox("📁 Выберите таблицу", st.session_state['tables'])
+        selected_table = st.selectbox("Выберите таблицу", st.session_state['tables'])
         table_columns = load_table_columns(st.session_state['engine'], selected_table)
         exclude_cols = st.multiselect("Колонки, которые НЕ учитывать при поиске дубликатов (например, id, timestamp)",
                                       table_columns,
@@ -259,7 +259,7 @@ def main():
         df_raw = st.session_state['df_raw']
         exclude_cols = st.session_state.get('exclude_cols', [])
 
-        st.subheader("📋 Исходные данные (первые 10 строк)")
+        st.subheader("Исходные данные (первые 10 строк)")
         st.dataframe(df_raw.head(10))
 
         # Краткая диагностика перед анализом
@@ -268,7 +268,7 @@ def main():
         col2.metric("Столбцов", len(df_raw.columns))
         col3.metric("Строк с пропусками (исходно)", df_raw.isnull().any(axis=1).sum())
 
-        tab1, tab2, tab3 = st.tabs(["⚙️ Настройки", "📈 Результаты", "📄 Экспорт"])
+        tab1, tab2, tab3 = st.tabs(["Настройки", "Результаты", "Экспорт"])
 
         with tab1:
             st.header("Параметры анализа")
@@ -282,7 +282,7 @@ def main():
                 st.info("Рекомендуется 0.05–0.1 для реальных данных.")
             handle_miss = st.checkbox("Заполнить пропуски (числовые – медианой, категории – модой)", value=True)
 
-            if st.button("🚀 ЗАПУСТИТЬ АНАЛИЗ", type="primary"):
+            if st.button("ЗАПУСТИТЬ АНАЛИЗ", type="primary"):
                 progress = st.progress(0)
                 status = st.empty()
                 df_work = df_raw.copy()
@@ -327,11 +327,11 @@ def main():
                 dupe_groups = st.session_state.get('dupe_groups', [])
                 report_df = generate_report(df_res, dupe_groups, original_df=df_raw)
 
-                st.subheader("🔍 Таблица с выявленными проблемами")
+                st.subheader("Таблица с выявленными проблемами")
                 st.dataframe(report_df.head(50))
 
                 # Детальная статистика
-                st.subheader("📊 Детальная статистика")
+                st.subheader("Детальная статистика")
                 d1, d2, d3, d4, d5 = st.columns(5)
                 d1.metric("Всего записей", len(df_res))
                 d2.metric("Групп дубликатов", len(dupe_groups))
@@ -353,7 +353,7 @@ def main():
                 st.divider()
                 g1, g2 = st.columns(2)
                 with g1:
-                    st.subheader("📉 Гистограмма аномалий")
+                    st.subheader("Гистограмма аномалий")
                     numeric_cols = df_res.select_dtypes(include=[np.number]).columns.tolist()
                     numeric_cols = [c for c in numeric_cols if c not in ['duplicate_group', 'outlier_score', 'is_outlier']]
                     if numeric_cols:
@@ -364,7 +364,7 @@ def main():
                         st.info("Нет числовых колонок для построения гистограммы.")
 
                 with g2:
-                    st.subheader("🌡️ Тепловая карта пропусков (исходные данные)")
+                    st.subheader("Тепловая карта пропусков (исходные данные)")
                     fig_miss = plot_missing_heatmap(df_raw)
                     if fig_miss:
                         st.plotly_chart(fig_miss, use_container_width=True)
@@ -372,7 +372,7 @@ def main():
                         st.success("Нет пропусков для отображения.")
 
                 # Дополнительная диагностика: покажем несколько примеров аномалий и дубликатов
-                with st.expander("🔎 Примеры найденных проблем"):
+                with st.expander("Примеры найденных проблем"):
                     outlier_mask = get_outlier_mask(df_res)
                     if outlier_mask.any():
                         st.write("**Примеры аномальных записей:**")
@@ -390,7 +390,7 @@ def main():
                 df_res = st.session_state['df_processed']
                 report_df = generate_report(df_res, st.session_state.get('dupe_groups', []), original_df=df_raw)
                 csv = report_df.to_csv(index=False).encode('utf-8')
-                st.download_button("⬇️ Скачать отчёт (CSV)", csv, "quality_report.csv", "text/csv")
+                st.download_button("Скачать отчёт (CSV)", csv, "quality_report.csv", "text/csv")
                 st.markdown("Отчёт включает все исходные колонки + `duplicate_group`, `is_outlier`, `outlier_score`, `problem_type`.")
             else:
                 st.info("Нет данных для экспорта. Запустите анализ.")
