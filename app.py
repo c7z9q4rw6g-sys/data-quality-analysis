@@ -220,7 +220,7 @@ def main():
             password = ""
         else:
             user = st.text_input("Пользователь", "postgres")
-            password = st.text_input("Пароль", type="password", "")
+            password = st.text_input("Пароль", type="password", value="")
         
         if st.button("Подключиться"):
             if db_type == "SQLite" and not database:
