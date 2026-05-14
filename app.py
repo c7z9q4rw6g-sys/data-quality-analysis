@@ -305,4 +305,4 @@ def main():
                 st.info("Сначала выполните анализ")
 
 if __name__ == "__main__":
-   main()
+   main()
