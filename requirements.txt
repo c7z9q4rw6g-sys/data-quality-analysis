@@ -7,3 +7,4 @@ pymysql
 plotly
 scikit-learn
 pyod
+dedupe
