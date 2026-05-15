@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import dedupe
-from dedupe import variables as dv  
 from sqlalchemy import create_engine, inspect
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
@@ -10,15 +9,10 @@ from pyod.models.iforest import IForest
 import plotly.express as px
 import plotly.graph_objects as go
 
-# Константы
 NO_DUPLICATE_GROUP = -1
 NORMAL_LABEL = 0
-OUTLIER_LABEL = 1  
 INTERNAL_COLUMNS = {'duplicate_group', 'is_outlier', 'outlier_score'}
 
-# ----------------------------------------------------------------------
-# 1. Подключение к БД
-# ----------------------------------------------------------------------
 def get_engine(db_type, host, port, database, user, password):
     try:
         if db_type == "PostgreSQL":
@@ -55,9 +49,6 @@ def load_table_columns(engine, table_name):
     except Exception as e:
         return []
 
-# ----------------------------------------------------------------------
-# 2. Обнаружение дубликатов (DEDUPE 3.0+)
-# ----------------------------------------------------------------------
 def detect_duplicates_with_dedupe(df, exclude_cols=None, threshold=0.5):
     if exclude_cols is None:
         exclude_cols = []
@@ -69,23 +60,42 @@ def detect_duplicates_with_dedupe(df, exclude_cols=None, threshold=0.5):
         df['duplicate_group'] = NO_DUPLICATE_GROUP
         return df, []
 
-    # Подготовка данных
     data_dict = df[compare_cols].fillna('').to_dict(orient='index')
 
-    # Новый синтаксис dedupe 3.0+
-    fields = [dv.String(col) for col in compare_cols]
+    fields = []
+    for col in compare_cols:
+        fields.append({'field': col, 'type': 'String'})
+
     deduper = dedupe.Dedupe(fields)
     
-    # В dedupe 3.0 нет sample(), используем prepare()
-    deduper.prepare(data_dict)
+    try:
+        deduper.sample(data_dict, sample_size=10000)
+        deduper.train(rrl=None, unsupervised_learning=True)
+        clusters = deduper.partition(data_dict, threshold=threshold)
+    except Exception as e:
+        st.warning(f"Dedupe error: {e}. Using simple method.")
+        df_clean = df[compare_cols].copy()
+        for col in df_clean.select_dtypes(include=['object']).columns:
+            df_clean[col] = df_clean[col].astype(str).str.strip().str.lower()
+        df_clean = df_clean.fillna('')
+        
+        df_result = df.copy()
+        df_result['duplicate_group'] = NO_DUPLICATE_GROUP
+        dupe_groups = []
+        dup_mask = df_clean.duplicated(keep=False)
+        dup_df = df_clean[dup_mask]
+        
+        if not dup_df.empty:
+            grouped = dup_df.groupby(list(df_clean.columns), dropna=False, sort=False).groups
+            group_id = 0
+            for key, indices in grouped.items():
+                if len(indices) > 1:
+                    dupe_groups.append(list(indices))
+                    for idx in indices:
+                        df_result.at[idx, 'duplicate_group'] = group_id
+                    group_id += 1
+        return df_result, dupe_groups
     
-    # Обучаем без активной разметки
-    deduper.train(unsupervised_learning=True)
-    
-    # Находим дубликаты
-    clusters = deduper.partition(data_dict, threshold=threshold)
-    
-    # Обработка результатов
     df_result = df.copy()
     df_result['duplicate_group'] = NO_DUPLICATE_GROUP
     
@@ -102,22 +112,11 @@ def detect_duplicates_with_dedupe(df, exclude_cols=None, threshold=0.5):
             
     return df_result, dupe_groups
 
-# ----------------------------------------------------------------------
-# 3. Обнаружение аномалий (Isolation Forest) 
-# ----------------------------------------------------------------------
 def detect_outliers_numeric(df, contamination=0.1):
-    """
-    Обнаружение аномалий. 
-    PyOD возвращает: -1 для аномалий, 1 для нормы.
-    Мы конвертируем: 1 = аномалия, 0 = норма (для удобства)
-    """
-    num_cols = [
-        col for col in df.select_dtypes(include=[np.number]).columns
-        if col not in INTERNAL_COLUMNS
-    ]
+    num_cols = [col for col in df.select_dtypes(include=[np.number]).columns if col not in INTERNAL_COLUMNS]
     
     if len(num_cols) == 0:
-        df['is_outlier'] = NORMAL_LABEL
+        df['is_outlier'] = 0
         df['outlier_score'] = 0.0
         return df
 
@@ -131,17 +130,11 @@ def detect_outliers_numeric(df, contamination=0.1):
     clf = IForest(contamination=contamination, random_state=42, n_estimators=100)
     clf.fit(X_scaled)
     
-    # PyOD labels: -1 для аномалий, 1 для нормы
-    # Конвертируем: аномалия = 1, норма = 0
-    raw_labels = clf.labels_
-    df['is_outlier'] = (raw_labels == -1).astype(int)  # -1 -> 1 (аномалия), 1 -> 0 (норма)
+    df['is_outlier'] = (clf.labels_ == -1).astype(int)
     df['outlier_score'] = clf.decision_scores_
     
     return df
 
-# ----------------------------------------------------------------------
-# 4. Заполнение пропусков
-# ----------------------------------------------------------------------
 def impute_missing(df):
     num_cols = df.select_dtypes(include=[np.number]).columns
     cat_cols = df.select_dtypes(include=['object']).columns
@@ -154,24 +147,18 @@ def impute_missing(df):
         df[cat_cols] = imp_cat.fit_transform(df[cat_cols])
     return df
 
-# ----------------------------------------------------------------------
-# 5. Утилиты и отчеты
-# ----------------------------------------------------------------------
 def generate_report(df, dupe_groups=None, original_df=None):
     report = df.copy()
     report['problem_type'] = ''
     
-    # Дубликаты
     if 'duplicate_group' in report.columns:
         dup_mask = report['duplicate_group'] != NO_DUPLICATE_GROUP
         report.loc[dup_mask, 'problem_type'] += 'дубликат; '
         
-    # Аномалии (теперь is_outlier = 1 для аномалий)
     if 'is_outlier' in report.columns:
-        out_mask = report['is_outlier'] == 1  
+        out_mask = report['is_outlier'] == 1
         report.loc[out_mask, 'problem_type'] += 'аномалия; '
         
-    # Пропуски
     check_df = original_df if original_df is not None else report
     miss_mask = check_df.isnull().any(axis=1)
     report.loc[miss_mask.reindex(report.index, fill_value=False), 'problem_type'] += 'пропуск; '
@@ -199,14 +186,10 @@ def plot_missing_heatmap(df):
     if missing.sum().sum() == 0:
         return None
         
-    fig = px.imshow(missing.T, 
-                    title='Тепловая карта пропусков (Желтый = Пропуск)',
+    fig = px.imshow(missing.T, title='Тепловая карта пропусков (Желтый = Пропуск)',
                     color_continuous_scale='Viridis', aspect='auto')
     return fig
 
-# ----------------------------------------------------------------------
-# 6. Главное приложение
-# ----------------------------------------------------------------------
 def main():
     st.set_page_config(page_title="Анализ качества данных", layout="wide")
     st.title("Интеллектуальная система анализа качества данных")
@@ -216,11 +199,7 @@ def main():
         db_type = st.selectbox("Тип СУБД", ["SQLite", "PostgreSQL", "MySQL"])
         
         if db_type == "SQLite":
-            host = ""
-            port = ""
             database = st.text_input("Имя файла .db", "test_quality_with_defects.db")
-            user = ""
-            password = ""
         else:
             host = st.text_input("Хост", "localhost")
             port = st.text_input("Порт", "5432" if db_type=="PostgreSQL" else "3306")
@@ -229,7 +208,7 @@ def main():
             password = st.text_input("Пароль", type="password")
 
         if st.button("Подключиться"):
-            engine = get_engine(db_type, host, port, database, user, password)
+            engine = get_engine(db_type, "", "", database, "", "" if db_type=="SQLite" else user, "" if db_type=="SQLite" else password)
             if engine:
                 st.session_state['engine'] = engine
                 try:
@@ -248,11 +227,7 @@ def main():
         selected_table = st.selectbox("Выберите таблицу", st.session_state['tables'])
         table_columns = load_table_columns(st.session_state['engine'], selected_table)
         
-        exclude_cols = st.multiselect(
-            "Колонки, которые НЕ учитывать при поиске дубликатов",
-            table_columns,
-            default=[c for c in table_columns if c.lower() == 'id']
-        )
+        exclude_cols = st.multiselect("Колонки, которые НЕ учитывать при поиске дубликатов", table_columns, default=[])
         
         if st.button("Загрузить данные"):
             df_raw = load_table(st.session_state['engine'], selected_table, limit=50000)
@@ -280,9 +255,8 @@ def main():
             c1, c2 = st.columns(2)
             
             with c1:
-                detect_dup = st.checkbox("Обнаружить дубликаты (Dedupe)", value=True)
+                detect_dup = st.checkbox("Обнаружить дубликаты", value=True)
                 dedupe_threshold = st.slider("Порог уверенности дубликатов", 0.1, 0.9, 0.5, 0.05)
-                # УБРАНА СИНЯЯ ПЛАШКА: st.info("Используется библиотека Dedupe...")
                 
             with c2:
                 detect_out = st.checkbox("Обнаружить аномалии", value=True)
@@ -295,17 +269,12 @@ def main():
                 status = st.empty()
                 df_work = df_raw.copy()
 
-                # 1. ДУБЛИКАТЫ
                 if detect_dup:
-                    status.text("Поиск дубликатов (Dedupe)...")
+                    status.text("Поиск дубликатов...")
                     try:
-                        df_work, dupe_groups = detect_duplicates_with_dedupe(
-                            df_work, 
-                            exclude_cols=exclude_cols, 
-                            threshold=dedupe_threshold
-                        )
+                        df_work, dupe_groups = detect_duplicates_with_dedupe(df_work, exclude_cols=exclude_cols, threshold=dedupe_threshold)
                         st.session_state['dupe_groups'] = dupe_groups
-                        st.success(f"✓ Найдено {len(dupe_groups)} групп дубликатов")
+                        st.success(f"Найдено {len(dupe_groups)} групп дубликатов")
                     except Exception as e:
                         st.error(f"Ошибка в Dedupe: {e}")
                         df_work['duplicate_group'] = NO_DUPLICATE_GROUP
@@ -315,18 +284,16 @@ def main():
                     st.session_state['dupe_groups'] = []
                 progress.progress(25)
 
-                # 2. АНОМАЛИИ
                 if detect_out:
-                    status.text("Поиск аномалий (Isolation Forest)...")
+                    status.text("Поиск аномалий...")
                     df_work = detect_outliers_numeric(df_work, contamination=contamination)
                     n_found = (df_work['is_outlier'] == 1).sum()
-                    st.success(f"✓ Найдено {n_found} аномалий")
+                    st.success(f"Найдено {n_found} аномалий")
                 else:
-                    df_work['is_outlier'] = NORMAL_LABEL
+                    df_work['is_outlier'] = 0
                     df_work['outlier_score'] = 0.0
                 progress.progress(50)
 
-                # 3. ПРОПУСКИ
                 if handle_miss:
                     status.text("Заполнение пропусков...")
                     df_work = impute_missing(df_work)
@@ -334,7 +301,7 @@ def main():
 
                 st.session_state['df_processed'] = df_work
                 st.session_state['analysis_complete'] = True
-                status.text("✓ Анализ завершён!")
+                status.text("Анализ завершён!")
                 progress.progress(100)
                 st.success("Перейдите на вкладку «Результаты»")
 
@@ -342,7 +309,6 @@ def main():
             if st.session_state.get('analysis_complete', False):
                 df_res = st.session_state['df_processed']
                 dupe_groups = st.session_state.get('dupe_groups', [])
-                
                 report_df = generate_report(df_res, dupe_groups, original_df=df_raw)
 
                 st.subheader("Таблица с выявленными проблемами")
@@ -352,25 +318,16 @@ def main():
                 d1, d2, d3, d4, d5 = st.columns(5)
                 d1.metric("Всего записей", len(df_res))
                 d2.metric("Групп дубликатов", len(dupe_groups))
-                
-                dup_rows = (df_res['duplicate_group'] != NO_DUPLICATE_GROUP).sum()
-                d3.metric("Строк-дубликатов", int(dup_rows))
-                
-                out_rows = (df_res['is_outlier'] == 1).sum()  # ИСПРАВЛЕНО
-                d4.metric("Аномалий", int(out_rows))
-                
-                miss_rows = df_raw.isnull().any(axis=1).sum()
-                d5.metric("Строк с пропусками", int(miss_rows))
+                d3.metric("Строк-дубликатов", int((df_res['duplicate_group'] != NO_DUPLICATE_GROUP).sum()))
+                d4.metric("Аномалий", int((df_res['is_outlier'] == 1).sum()))
+                d5.metric("Строк с пропусками", int(df_raw.isnull().any(axis=1).sum()))
 
                 st.divider()
-                
                 g1, g2 = st.columns(2)
                 
                 with g1:
                     st.subheader("Гистограмма аномалий")
-                    numeric_cols = df_res.select_dtypes(include=[np.number]).columns.tolist()
-                    numeric_cols = [c for c in numeric_cols if c not in ['duplicate_group', 'outlier_score', 'is_outlier']]
-                    
+                    numeric_cols = [c for c in df_res.select_dtypes(include=[np.number]).columns if c not in ['duplicate_group', 'outlier_score', 'is_outlier']]
                     if numeric_cols:
                         chosen = st.selectbox("Выберите столбец", numeric_cols, key="hist")
                         fig = plot_outliers_histogram(df_res, chosen)
@@ -383,7 +340,6 @@ def main():
                         st.plotly_chart(fig_miss, use_container_width=True)
                     else:
                         st.info("Нет пропусков для отображения.")
-                        
             else:
                 st.info("Сначала настройте параметры и запустите анализ.")
 
@@ -392,7 +348,6 @@ def main():
                 df_res = st.session_state['df_processed']
                 report_df = generate_report(df_res, st.session_state.get('dupe_groups', []), original_df=df_raw)
                 csv = report_df.to_csv(index=False).encode('utf-8')
-                
                 st.download_button("Скачать отчёт (CSV)", csv, "quality_report.csv", "text/csv")
             else:
                 st.info("Нет данных для экспорта.")
