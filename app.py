@@ -1,8 +1,8 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import dedupe  
-import os
+import dedupe
+from dedupe import variables as dv  
 from sqlalchemy import create_engine, inspect
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
@@ -13,7 +13,7 @@ import plotly.graph_objects as go
 # Константы
 NO_DUPLICATE_GROUP = -1
 NORMAL_LABEL = 0
-OUTLIER_LABEL = 1
+OUTLIER_LABEL = 1  
 INTERNAL_COLUMNS = {'duplicate_group', 'is_outlier', 'outlier_score'}
 
 # ----------------------------------------------------------------------
@@ -56,17 +56,16 @@ def load_table_columns(engine, table_name):
         return []
 
 # ----------------------------------------------------------------------
-# 2. Обнаружение дубликатов (DEDUPE)
+# 2. Обнаружение дубликатов (DEDUPE 3.0+)
 # ----------------------------------------------------------------------
 def detect_duplicates_with_dedupe(df, exclude_cols=None, threshold=0.5):
     """
-    Использует библиотеку dedupe для поиска дубликатов.
-    Реализует логику, описанную в дипломе (блокирование, сравнение, порог).
+    Использует библиотеку dedupe 3.0+ для поиска дубликатов.
     """
     if exclude_cols is None:
         exclude_cols = []
 
-    # Исключаем служебные колонки и те, что выбрал пользователь
+    # Исключаем служебные колонки
     compare_cols = [c for c in df.columns if c.lower() not in [x.lower() for x in exclude_cols] 
                     and c.lower() not in ['id', 'index', 'duplicate_group']]
     
@@ -74,30 +73,24 @@ def detect_duplicates_with_dedupe(df, exclude_cols=None, threshold=0.5):
         df['duplicate_group'] = NO_DUPLICATE_GROUP
         return df, []
 
-    # Подготовка данных для dedupe (он требует словарь и не любит NaN)
-    # dedupe не работает с pandas DataFrame напрямую
+    # Подготовка данных для dedupe
     data_dict = df[compare_cols].fillna('').to_dict(orient='index')
 
-    # Определяем поля для сравнения
+    # НОВЫЙ СИНТАКСИС для dedupe 3.0+
     fields = []
     for col in compare_cols:
-        # dedupe требует явного указания типа поля
-        fields.append({'field': col, 'type': 'String'})
+        fields.append(dv.String(col))  # Вместо {'field': col, 'type': 'String'}
 
     # Инициализация модели
     deduper = dedupe.Dedupe(fields)
     
-    # Сэмплирование данных для ускорения (блокирование)
-    # В реальном активном обучении здесь deduper.sample() и ручная разметка
-    # Для автоматической работы системы используем partition с порогом
+    # Сэмплирование
     deduper.sample(data_dict, sample_size=10000)
     
-    # Поскольку у нас нет интерфейса для разметки "Да/Нет" прямо сейчас,
-    # dedupe использует настройки по умолчанию или обучается на лету, 
-    # если бы мы передавали labeled_pairs. 
-    # Здесь мы полагаемся на эвристики dedupe для String полей.
+    # Обучаем (без активной разметки для автоматической работы)
+    deduper.train(rrl=None, unsupervised_learning=True)
     
-    # Кластеризация (поиск дубликатов)
+    # Кластеризация
     clusters = deduper.partition(data_dict, threshold=threshold)
     
     # Обработка результатов
@@ -108,9 +101,7 @@ def detect_duplicates_with_dedupe(df, exclude_cols=None, threshold=0.5):
     group_id = 0
     
     for cluster in clusters:
-        # cluster выглядит как ((id1, id2, ...), probability)
         indices = cluster[0]
-        # prob = cluster[1] # можно использовать для фильтрации по уверенности
         
         if len(indices) > 1:
             dupe_groups.append(list(indices))
@@ -121,9 +112,14 @@ def detect_duplicates_with_dedupe(df, exclude_cols=None, threshold=0.5):
     return df_result, dupe_groups
 
 # ----------------------------------------------------------------------
-# 3. Обнаружение аномалий (Isolation Forest)
+# 3. Обнаружение аномалий (Isolation Forest) 
 # ----------------------------------------------------------------------
 def detect_outliers_numeric(df, contamination=0.1):
+    """
+    Обнаружение аномалий. 
+    PyOD возвращает: -1 для аномалий, 1 для нормы.
+    Мы конвертируем: 1 = аномалия, 0 = норма (для удобства)
+    """
     num_cols = [
         col for col in df.select_dtypes(include=[np.number]).columns
         if col not in INTERNAL_COLUMNS
@@ -144,10 +140,12 @@ def detect_outliers_numeric(df, contamination=0.1):
     clf = IForest(contamination=contamination, random_state=42, n_estimators=100)
     clf.fit(X_scaled)
     
-    # PyOD labels: -1 для аномалий, 1 для нормы. Мы конвертируем в 1 (аномалия) и 0 (норма)
+    # PyOD labels: -1 для аномалий, 1 для нормы
+    # Конвертируем: аномалия = 1, норма = 0
     raw_labels = clf.labels_
-    df['is_outlier'] = (raw_labels == -1).astype(int)
+    df['is_outlier'] = (raw_labels == -1).astype(int)  # -1 -> 1 (аномалия), 1 -> 0 (норма)
     df['outlier_score'] = clf.decision_scores_
+    
     return df
 
 # ----------------------------------------------------------------------
@@ -177,12 +175,12 @@ def generate_report(df, dupe_groups=None, original_df=None):
         dup_mask = report['duplicate_group'] != NO_DUPLICATE_GROUP
         report.loc[dup_mask, 'problem_type'] += 'дубликат; '
         
-    # Аномалии
+    # Аномалии (теперь is_outlier = 1 для аномалий)
     if 'is_outlier' in report.columns:
-        out_mask = report['is_outlier'] == OUTLIER_LABEL
+        out_mask = report['is_outlier'] == 1  
         report.loc[out_mask, 'problem_type'] += 'аномалия; '
         
-    # Пропуски (проверяем по оригиналу, если он передан)
+    # Пропуски
     check_df = original_df if original_df is not None else report
     miss_mask = check_df.isnull().any(axis=1)
     report.loc[miss_mask.reindex(report.index, fill_value=False), 'problem_type'] += 'пропуск; '
@@ -204,7 +202,6 @@ def plot_outliers_histogram(df, col):
     return fig
 
 def plot_missing_heatmap(df):
-    # Берем выборку для скорости
     sample_df = df.head(500).iloc[:, :20]
     missing = sample_df.isnull().astype(int)
     
@@ -223,7 +220,6 @@ def main():
     st.set_page_config(page_title="Анализ качества данных", layout="wide")
     st.title("Интеллектуальная система анализа качества данных")
 
-    # --- Боковая панель ---
     with st.sidebar:
         st.header("Подключение к БД")
         db_type = st.selectbox("Тип СУБД", ["SQLite", "PostgreSQL", "MySQL"])
@@ -257,13 +253,12 @@ def main():
                 except Exception as e:
                     st.error(f"Ошибка получения таблиц: {e}")
 
-    # --- Выбор таблицы ---
     if 'engine' in st.session_state and 'tables' in st.session_state:
         selected_table = st.selectbox("Выберите таблицу", st.session_state['tables'])
         table_columns = load_table_columns(st.session_state['engine'], selected_table)
         
         exclude_cols = st.multiselect(
-            "Колонки, которые НЕ учитывать при поиске дубликатов (например, id)",
+            "Колонки, которые НЕ учитывать при поиске дубликатов",
             table_columns,
             default=[c for c in table_columns if c.lower() == 'id']
         )
@@ -273,10 +268,8 @@ def main():
             if df_raw is not None:
                 st.session_state['df_raw'] = df_raw
                 st.session_state['exclude_cols'] = exclude_cols
-                st.session_state['selected_table'] = selected_table
                 st.success(f"Загружено {len(df_raw)} записей")
 
-    # --- Анализ ---
     if 'df_raw' in st.session_state:
         df_raw = st.session_state['df_raw']
         exclude_cols = st.session_state.get('exclude_cols', [])
@@ -287,7 +280,7 @@ def main():
         col1, col2, col3 = st.columns(3)
         col1.metric("Всего строк", len(df_raw))
         col2.metric("Столбцов", len(df_raw.columns))
-        col3.metric("Строк с пропусками (исходно)", df_raw.isnull().any(axis=1).sum())
+        col3.metric("Строк с пропусками", df_raw.isnull().any(axis=1).sum())
 
         tab1, tab2, tab3 = st.tabs(["Настройки", "Результаты", "Экспорт"])
 
@@ -297,9 +290,8 @@ def main():
             
             with c1:
                 detect_dup = st.checkbox("Обнаружить дубликаты (Dedupe)", value=True)
-                # Порог для dedupe (0.5 - стандарт)
                 dedupe_threshold = st.slider("Порог уверенности дубликатов", 0.1, 0.9, 0.5, 0.05)
-                st.info("Используется библиотека Dedupe с активным обучением.")
+                # УБРАНА СИНЯЯ ПЛАШКА: st.info("Используется библиотека Dedupe...")
                 
             with c2:
                 detect_out = st.checkbox("Обнаружить аномалии", value=True)
@@ -312,20 +304,19 @@ def main():
                 status = st.empty()
                 df_work = df_raw.copy()
 
-                # 1. ДУБЛИКАТЫ (DEDUPE)
+                # 1. ДУБЛИКАТЫ
                 if detect_dup:
-                    status.text("Поиск дубликатов через Dedupe (может занять время)...")
+                    status.text("Поиск дубликатов (Dedupe)...")
                     try:
-                        # Важно: dedupe требует строковых данных для сравнения полей
                         df_work, dupe_groups = detect_duplicates_with_dedupe(
                             df_work, 
                             exclude_cols=exclude_cols, 
                             threshold=dedupe_threshold
                         )
                         st.session_state['dupe_groups'] = dupe_groups
-                        st.success(f"Найдено {len(dupe_groups)} групп дубликатов")
+                        st.success(f"✓ Найдено {len(dupe_groups)} групп дубликатов")
                     except Exception as e:
-                        st.error(f"Ошибка в модуле Dedupe: {e}")
+                        st.error(f"Ошибка в Dedupe: {e}")
                         df_work['duplicate_group'] = NO_DUPLICATE_GROUP
                         st.session_state['dupe_groups'] = []
                 else:
@@ -337,6 +328,8 @@ def main():
                 if detect_out:
                     status.text("Поиск аномалий (Isolation Forest)...")
                     df_work = detect_outliers_numeric(df_work, contamination=contamination)
+                    n_found = (df_work['is_outlier'] == 1).sum()
+                    st.success(f"✓ Найдено {n_found} аномалий")
                 else:
                     df_work['is_outlier'] = NORMAL_LABEL
                     df_work['outlier_score'] = 0.0
@@ -350,7 +343,7 @@ def main():
 
                 st.session_state['df_processed'] = df_work
                 st.session_state['analysis_complete'] = True
-                status.text("Анализ завершён!")
+                status.text("✓ Анализ завершён!")
                 progress.progress(100)
                 st.success("Перейдите на вкладку «Результаты»")
 
@@ -372,11 +365,11 @@ def main():
                 dup_rows = (df_res['duplicate_group'] != NO_DUPLICATE_GROUP).sum()
                 d3.metric("Строк-дубликатов", int(dup_rows))
                 
-                out_rows = (df_res['is_outlier'] == 1).sum()
-                d4.metric("Аномалий (Isolation Forest)", int(out_rows))
+                out_rows = (df_res['is_outlier'] == 1).sum()  # ИСПРАВЛЕНО
+                d4.metric("Аномалий", int(out_rows))
                 
                 miss_rows = df_raw.isnull().any(axis=1).sum()
-                d5.metric("Строк с пропусками (исходно)", int(miss_rows))
+                d5.metric("Строк с пропусками", int(miss_rows))
 
                 st.divider()
                 
@@ -388,7 +381,7 @@ def main():
                     numeric_cols = [c for c in numeric_cols if c not in ['duplicate_group', 'outlier_score', 'is_outlier']]
                     
                     if numeric_cols:
-                        chosen = st.selectbox("Выберите числовой столбец", numeric_cols, key="hist")
+                        chosen = st.selectbox("Выберите столбец", numeric_cols, key="hist")
                         fig = plot_outliers_histogram(df_res, chosen)
                         st.plotly_chart(fig, use_container_width=True)
                         
@@ -410,7 +403,6 @@ def main():
                 csv = report_df.to_csv(index=False).encode('utf-8')
                 
                 st.download_button("Скачать отчёт (CSV)", csv, "quality_report.csv", "text/csv")
-                st.caption("Отчёт включает: duplicate_group, is_outlier, outlier_score, problem_type")
             else:
                 st.info("Нет данных для экспорта.")
 
