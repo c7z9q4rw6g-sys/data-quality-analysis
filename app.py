@@ -59,13 +59,9 @@ def load_table_columns(engine, table_name):
 # 2. Обнаружение дубликатов (DEDUPE 3.0+)
 # ----------------------------------------------------------------------
 def detect_duplicates_with_dedupe(df, exclude_cols=None, threshold=0.5):
-    """
-    Использует библиотеку dedupe 3.0+ для поиска дубликатов.
-    """
     if exclude_cols is None:
         exclude_cols = []
 
-    # Исключаем служебные колонки
     compare_cols = [c for c in df.columns if c.lower() not in [x.lower() for x in exclude_cols] 
                     and c.lower() not in ['id', 'index', 'duplicate_group']]
     
@@ -73,24 +69,20 @@ def detect_duplicates_with_dedupe(df, exclude_cols=None, threshold=0.5):
         df['duplicate_group'] = NO_DUPLICATE_GROUP
         return df, []
 
-    # Подготовка данных для dedupe
+    # Подготовка данных
     data_dict = df[compare_cols].fillna('').to_dict(orient='index')
 
-    # НОВЫЙ СИНТАКСИС для dedupe 3.0+
-    fields = []
-    for col in compare_cols:
-        fields.append(dv.String(col))  # Вместо {'field': col, 'type': 'String'}
-
-    # Инициализация модели
+    # Новый синтаксис dedupe 3.0+
+    fields = [dv.String(col) for col in compare_cols]
     deduper = dedupe.Dedupe(fields)
     
-    # Сэмплирование
-    deduper.sample(data_dict, sample_size=10000)
+    # В dedupe 3.0 нет sample(), используем prepare()
+    deduper.prepare(data_dict)
     
-    # Обучаем (без активной разметки для автоматической работы)
-    deduper.train(rrl=None, unsupervised_learning=True)
+    # Обучаем без активной разметки
+    deduper.train(unsupervised_learning=True)
     
-    # Кластеризация
+    # Находим дубликаты
     clusters = deduper.partition(data_dict, threshold=threshold)
     
     # Обработка результатов
@@ -102,7 +94,6 @@ def detect_duplicates_with_dedupe(df, exclude_cols=None, threshold=0.5):
     
     for cluster in clusters:
         indices = cluster[0]
-        
         if len(indices) > 1:
             dupe_groups.append(list(indices))
             for idx in indices:
